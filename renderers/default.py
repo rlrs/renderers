@@ -80,6 +80,21 @@ def _decode_tool_call_arguments(messages: list) -> list:
     return out
 
 
+def _is_missing_user_query_error(exc: Exception) -> bool:
+    return "No user query found in messages" in str(exc)
+
+
+def _has_user_message(messages: list) -> bool:
+    for message in messages:
+        if isinstance(message, dict):
+            role = message.get("role")
+        else:
+            role = getattr(message, "role", None)
+        if role == "user":
+            return True
+    return False
+
+
 class DefaultRenderer:
     """Fallback renderer using tokenizer.apply_chat_template().
 
@@ -130,7 +145,18 @@ class DefaultRenderer:
         prev_len = 0
 
         for idx, message in enumerate(messages):
-            cur_ids = self._apply(messages[: idx + 1], tools=tools)
+            prefix = messages[: idx + 1]
+            try:
+                cur_ids = self._apply(prefix, tools=tools)
+            except Exception as exc:
+                # Some templates reject incomplete prefixes such as a lone
+                # system message, even though the full prompt is valid once the
+                # first user turn is present. Skip only that attribution prefix.
+                if _is_missing_user_query_error(exc) and not _has_user_message(
+                    prefix
+                ):
+                    continue
+                raise
             new_tokens = cur_ids[prev_len:]
             token_ids = cur_ids
             message_indices.extend([idx] * len(new_tokens))
