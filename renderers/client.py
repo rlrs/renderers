@@ -15,7 +15,6 @@ from typing import Any, cast
 
 import httpx
 from openai import AsyncOpenAI
-
 from renderers.base import (
     Message,
     MultiModalData,
@@ -51,9 +50,7 @@ class OverlongPromptError(Exception):
     def __init__(self, *, prompt_len: int, max_prompt_len: int) -> None:
         self.prompt_len = prompt_len
         self.max_prompt_len = max_prompt_len
-        super().__init__(
-            f"Prompt length ({prompt_len}) exceeds maximum context length ({max_prompt_len})."
-        )
+        super().__init__(f"Prompt length ({prompt_len}) exceeds maximum context length ({max_prompt_len}).")
 
 
 class MalformedGenerateResponseError(ValueError):
@@ -134,20 +131,52 @@ def parse_generate_response(raw: bytes) -> dict[str, Any]:
     return payload
 
 
-def _parse_completion_logprobs(
-    choice: Mapping[str, Any], completion_ids: list[int]
-) -> list[float]:
+def _parse_sampler_topk(choice, completion_ids, k):
+    """Keep original full-distribution probabilities; never normalize the head."""
+    if not k:
+        return None, None
+    import numpy as np
+
+    rows = choice["logprobs"]["content"]
+    ids, values = [], []
+    for row in rows:
+        head = row.get("top_logprobs")
+        if not isinstance(head, list) or len(head) < k:
+            raise MalformedGenerateResponseError(f"Score centering requires at least {k} top logprobs per token")
+        token_ids, logps = [], []
+        for item in head:
+            token = item.get("token", "")
+            value = item.get("logprob")
+            if not token.startswith("token_id:") or not token[9:].isdigit():
+                raise MalformedGenerateResponseError("Score centering requires numeric token_id logprobs")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value > 0
+                or value == VLLM_LOGPROB_SENTINEL
+            ):
+                raise MalformedGenerateResponseError("Invalid sampler head logprob")
+            token_ids.append(int(token[9:]))
+            logps.append(float(value))
+        if len(set(token_ids)) != len(token_ids) or sum(math.exp(v) for v in logps) > 1.00001:
+            raise MalformedGenerateResponseError("Invalid sampler head distribution")
+        order = sorted(range(len(logps)), key=lambda i: logps[i], reverse=True)[:k]
+        ids.append([token_ids[i] for i in order])
+        values.append([logps[i] for i in order])
+    return np.asarray(ids, dtype=np.int32).reshape(len(completion_ids), k), np.asarray(
+        values, dtype=np.float32
+    ).reshape(len(completion_ids), k)
+
+
+def _parse_completion_logprobs(choice: Mapping[str, Any], completion_ids: list[int]) -> list[float]:
     raw_logprobs = choice.get("logprobs")
     if not isinstance(raw_logprobs, Mapping):
-        raise MalformedGenerateResponseError(
-            "Engine response choice.logprobs must be an object."
-        )
+        raise MalformedGenerateResponseError("Engine response choice.logprobs must be an object.")
 
     content = raw_logprobs.get("content")
     if not isinstance(content, list):
-        raise MalformedGenerateResponseError(
-            "Engine response choice.logprobs.content must be a list."
-        )
+        raise MalformedGenerateResponseError("Engine response choice.logprobs.content must be a list.")
     if len(content) != len(completion_ids):
         raise MalformedGenerateResponseError(
             "Engine response completion token count "
@@ -157,9 +186,7 @@ def _parse_completion_logprobs(
     completion_logprobs: list[float] = []
     for index, entry in enumerate(content):
         if not isinstance(entry, Mapping):
-            raise MalformedGenerateResponseError(
-                f"Engine response choice.logprobs.content[{index}] must be an object."
-            )
+            raise MalformedGenerateResponseError(f"Engine response choice.logprobs.content[{index}] must be an object.")
         expected_token = f"token_id:{completion_ids[index]}"
         if entry.get("token") != expected_token:
             raise MalformedGenerateResponseError(
@@ -209,7 +236,7 @@ async def generate(
 
     ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
     set by us and override caller values: ``stop_token_ids`` (from the
-    renderer) and ``logprobs=1`` (we always emit completion_logprobs). Pass
+    renderer) and ``logprobs`` (1, or the requested score-centering head size). Pass
     ``prompt_ids`` to skip rendering and use a prebuilt token sequence —
     pair it with ``multi_modal_data`` when the prebuilt prompt has image /
     video placeholders that need engine-side mm payload, and with
@@ -263,12 +290,8 @@ async def generate(
             f"{type(renderer).__name__} does not support tools. "
             "Choose a model-specific renderer instead of the default fallback."
         )
-    if not process_multimodal and not getattr(
-        renderer, "supports_process_multimodal", False
-    ):
-        raise NotImplementedError(
-            f"{type(renderer).__name__} does not support process_multimodal=False"
-        )
+    if not process_multimodal and not getattr(renderer, "supports_process_multimodal", False):
+        raise NotImplementedError(f"{type(renderer).__name__} does not support process_multimodal=False")
 
     def _prepare():
         if prompt_ids is not None:
@@ -299,17 +322,28 @@ async def generate(
 
     prompt_ids, stop_token_ids, mm_data, prompt_attr = _prepare()
 
+    model_context_len = None
     if process_multimodal:
+        model_context_len = await _resolve_max_prompt_len(client, model)
         if max_prompt_len is None:
-            max_prompt_len = await _resolve_max_prompt_len(client, model)
+            max_prompt_len = model_context_len
         if max_prompt_len is not None and len(prompt_ids) > max_prompt_len:
-            raise OverlongPromptError(
-                prompt_len=len(prompt_ids), max_prompt_len=max_prompt_len
-            )
+            raise OverlongPromptError(prompt_len=len(prompt_ids), max_prompt_len=max_prompt_len)
 
     sp: dict[str, Any] = dict(sampling_params or {})
+    if model_context_len is not None:
+        remaining = model_context_len - len(prompt_ids)
+        if remaining <= 0:
+            raise OverlongPromptError(prompt_len=len(prompt_ids), max_prompt_len=model_context_len)
+        requested = sp.get("max_tokens")
+        sp["max_tokens"] = remaining if requested is None else min(requested, remaining)
     sp["stop_token_ids"] = stop_token_ids
-    sp["logprobs"] = 1
+    score_k = sp.pop("score_centering_top_k", 0)
+    if isinstance(score_k, bool) or not isinstance(score_k, int) or score_k < 0:
+        raise ValueError("score_centering_top_k must be a nonnegative integer")
+    # ServingTokens emits the sampled token first even if it is outside top-k.
+    # One extra slot retains the complete requested head in that case.
+    sp["logprobs"] = score_k + 1 if score_k else 1
     sp.setdefault("skip_special_tokens", False)
 
     body: dict[str, Any] = {
@@ -319,9 +353,7 @@ async def generate(
     }
     content_parts = _content_parts(messages) if not process_multimodal else None
     features = (
-        _build_mm_features(renderer, mm_data)
-        if process_multimodal and mm_data and not mm_data.is_empty()
-        else None
+        _build_mm_features(renderer, mm_data) if process_multimodal and mm_data and not mm_data.is_empty() else None
     )
     if content_parts:
         body["content_parts"] = content_parts
@@ -367,6 +399,8 @@ async def generate(
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
 
+    sampler_topk_ids, sampler_topk_logprobs = _parse_sampler_topk(choice, completion_ids, score_k)
+
     parsed = renderer.parse_response(completion_ids, tools=tools)
 
     routed_experts = choice.get("routed_experts")
@@ -383,9 +417,7 @@ async def generate(
     # ``parsed.tool_calls`` so verifiers can inspect them, but they don't
     # trigger the tool-loop continuation.
     finish_reason = choice.get("finish_reason")
-    ok_tool_calls = [
-        tc for tc in parsed.tool_calls if tc.status == ToolCallParseStatus.OK
-    ]
+    ok_tool_calls = [tc for tc in parsed.tool_calls if tc.status == ToolCallParseStatus.OK]
     if ok_tool_calls and finish_reason == "stop":
         finish_reason = "tool_calls"
 
@@ -396,6 +428,8 @@ async def generate(
         "mm_placeholders": mm_placeholders,
         "completion_ids": list(completion_ids),
         "completion_logprobs": completion_logprobs,
+        "sampler_topk_ids": sampler_topk_ids,
+        "sampler_topk_logprobs": sampler_topk_logprobs,
         "content": parsed.content,
         "reasoning_content": parsed.reasoning_content,
         "tool_calls": parsed.tool_calls,
@@ -439,9 +473,7 @@ def _content_parts(messages: list[Message]) -> list[dict[str, Any]]:
                 continue
             part_type = part.get("type")
             if part_type is None:
-                part_type = next(
-                    (key for key in _MEDIA_URL_TYPES if part.get(key)), None
-                )
+                part_type = next((key for key in _MEDIA_URL_TYPES if part.get(key)), None)
             if not isinstance(part_type, str) or part_type not in _MEDIA_URL_TYPES:
                 continue
             source = part.get(part_type)
@@ -531,9 +563,7 @@ def _build_gemma4_features(mm_data: MultiModalData) -> dict[str, Any]:
     }
     image_items = mm_data.mm_items.get("image") or []
     if image_items:
-        pixel_values = torch.cat(
-            [torch.as_tensor(item["pixel_values"]) for item in image_items], dim=0
-        )
+        pixel_values = torch.cat([torch.as_tensor(item["pixel_values"]) for item in image_items], dim=0)
         pixel_position_ids = torch.cat(
             [torch.as_tensor(item["image_position_ids"]) for item in image_items],
             dim=0,
@@ -549,9 +579,7 @@ def _build_gemma4_features(mm_data: MultiModalData) -> dict[str, Any]:
             "pixel_position_ids": MultiModalFieldConfig.batched("image"),
         }
         kwargs_items = MultiModalKwargsItems.from_hf_inputs(hf_inputs, field_config)
-        out["kwargs_data"]["image"] = [
-            encode_mm_kwargs_item(item) for item in kwargs_items["image"]
-        ]
+        out["kwargs_data"]["image"] = [encode_mm_kwargs_item(item) for item in kwargs_items["image"]]
         out["mm_hashes"]["image"] = list(mm_data.mm_hashes.get("image") or [])
         out["mm_placeholders"]["image"] = [
             {"offset": placeholder.offset, "length": placeholder.length}
@@ -563,9 +591,7 @@ def _build_gemma4_features(mm_data: MultiModalData) -> dict[str, Any]:
     return out
 
 
-def _build_qwen_vl_features(
-    mm_data: MultiModalData, *, spatial_merge_size: int
-) -> dict[str, Any]:
+def _build_qwen_vl_features(mm_data: MultiModalData, *, spatial_merge_size: int) -> dict[str, Any]:
     """vLLM features payload for the Qwen-VL family (Qwen2-VL / Qwen3-VL).
 
     Stacks per-image processor outputs back into a batched ``BatchFeature``,
@@ -603,23 +629,16 @@ def _build_qwen_vl_features(
         # mm_items now ship numpy arrays (the renderer is torch-free);
         # convert at this vLLM-glue boundary where torch is already a
         # hard dependency.
-        pixel_values = torch.cat(
-            [torch.as_tensor(it["pixel_values"]) for it in image_items], dim=0
-        )
-        image_grid_thw = torch.cat(
-            [torch.as_tensor(it["image_grid_thw"]) for it in image_items], dim=0
-        )
-        hf_inputs = BatchFeature(
-            data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
-        )
+        pixel_values = torch.cat([torch.as_tensor(it["pixel_values"]) for it in image_items], dim=0)
+        image_grid_thw = torch.cat([torch.as_tensor(it["image_grid_thw"]) for it in image_items], dim=0)
+        hf_inputs = BatchFeature(data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw})
         config = _create_qwen2vl_field_factory(spatial_merge_size)(hf_inputs)
         kwargs_items = MultiModalKwargsItems.from_hf_inputs(hf_inputs, config)
         encoded = [encode_mm_kwargs_item(it) for it in kwargs_items["image"]]
         out["kwargs_data"]["image"] = encoded
         out["mm_hashes"]["image"] = list(mm_data.mm_hashes.get("image") or [])
         out["mm_placeholders"]["image"] = [
-            {"offset": p.offset, "length": p.length}
-            for p in mm_data.mm_placeholders.get("image") or []
+            {"offset": p.offset, "length": p.length} for p in mm_data.mm_placeholders.get("image") or []
         ]
 
     # If kwargs_data is empty across all modalities, drop the key so vLLM

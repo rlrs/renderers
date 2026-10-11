@@ -184,3 +184,9 @@ Round-trip parity (render → parse → original) and token-level parity against
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+For score-centering training, `generate(..., sampling_params={"score_centering_top_k": 32})`
+retains full-distribution top-k IDs/logprobs as `sampler_topk_ids` and
+`sampler_topk_logprobs` arrays. Configure the engine for processed logprobs and at
+least k+1 output logprobs. The extra slot handles endpoints that prepend the
+sampled token outside the head; the returned head is never renormalized.
