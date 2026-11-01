@@ -408,10 +408,16 @@ def _parse_xml_tool_calls(
             arguments: dict = {}
             any_json_fallback = False
             for pm in re.finditer(
-                r"<parameter=([^>]+)>\n?(.*?)\n?</parameter>", block_text, re.DOTALL
+                r"<parameter=([^>]+)>(.*?)</parameter>", block_text, re.DOTALL
             ):
                 arg_name = pm.group(1)
-                arg_value = pm.group(2).strip()
+                # Trim only the template's wrapping newlines, as vLLM's parser does: a full
+                # strip() would drop the first line's indentation from edit/write arguments.
+                arg_value = pm.group(2)
+                if arg_value.startswith("\n"):
+                    arg_value = arg_value[1:]
+                if arg_value.endswith("\n"):
+                    arg_value = arg_value[:-1]
                 value, used_fallback = _coerce_arg_value(
                     arg_value, params.get(arg_name)
                 )
